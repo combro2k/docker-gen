@@ -44,6 +44,13 @@ func contains(item map[string]string, key string) bool {
 	return false
 }
 
+func exists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil { return true, nil }
+	if os.IsNotExist(err) { return false, nil }
+	return false, err
+}
+
 func generateFile(config Config, containers []*RuntimeContainer) bool {
 	templatePath := config.Template
 	tmpl, err := template.New(filepath.Base(templatePath)).Funcs(template.FuncMap{
@@ -51,6 +58,7 @@ func generateFile(config Config, containers []*RuntimeContainer) bool {
 		"groupBy":      groupBy,
 		"groupByMulti": groupByMulti,
 		"split":        strings.Split,
+		"exists":		exists,
 	}).ParseFiles(templatePath)
 	if err != nil {
 		log.Fatalf("unable to parse template: %s", err)
