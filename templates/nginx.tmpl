@@ -10,10 +10,12 @@ upstream {{ $host }} {
 }
 
 server {
-	#ssl_certificate /etc/nginx/certs/demo.pem;
-	#ssl_certificate_key /etc/nginx/certs/demo.key;
-
 	gzip_types text/plain text/css application/json application/x-javascript text/xml application/xml application/xml+rss text/javascript;
+
+	{{ if exists $host }}
+        ssl_certificate /etc/nginx/ssl/{{ $host }}/ssl.crt;
+	    ssl_certificate_key /etc/nginx/ssl/{{ $host }}/ssl.key;
+	{{ end }}
 
 	server_name {{ $host }};
 	proxy_buffering off;
