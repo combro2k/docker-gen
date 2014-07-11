@@ -44,6 +44,10 @@ func contains(item map[string]string, key string) bool {
 	return false
 }
 
+func checkSSLCerts(host string) (bool, error) {
+	return exists("/etc/nginx/ssl/" + host + "/ssl.crt")
+}
+
 func exists(file string) (bool, error) {
 	_, err := os.Stat(file)
 	if err == nil { return true, nil }
@@ -54,11 +58,12 @@ func exists(file string) (bool, error) {
 func generateFile(config Config, containers []*RuntimeContainer) bool {
 	templatePath := config.Template
 	tmpl, err := template.New(filepath.Base(templatePath)).Funcs(template.FuncMap{
-		"contains":     contains,
-		"groupBy":      groupBy,
-		"groupByMulti": groupByMulti,
-		"split":        strings.Split,
-		"exists":		exists,
+		"contains":      contains,
+		"groupBy":       groupBy,
+		"groupByMulti":  groupByMulti,
+		"split":         strings.Split,
+		"exists":		 exists,
+		"checkSSLCerts": checkSSLCerts,
 	}).ParseFiles(templatePath)
 	if err != nil {
 		log.Fatalf("unable to parse template: %s", err)
