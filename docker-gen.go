@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -15,17 +16,22 @@ import (
 )
 
 var (
-	buildVersion  string
-	version       bool
-	watch         bool
-	notifyCmd     string
-	onlyExposed   bool
-	onlyPublished bool
-	configFile    string
-	configs       ConfigFile
-	interval      int
-	endpoint      string
-	wg            sync.WaitGroup
+	buildVersion            string
+	version                 bool
+	watch                   bool
+	notifyCmd               string
+	notifySigHUPContainerID string
+	onlyExposed             bool
+	onlyPublished           bool
+	configFile              string
+	configs                 ConfigFile
+	interval                int
+	endpoint                string
+	tlsCert                 string
+	tlsKey                  string
+	tlsCaCert               string
+	tlsVerify               bool
+	wg                      sync.WaitGroup
 )
 
 type Event struct {
@@ -38,7 +44,15 @@ type Address struct {
 	IP       string
 	Port     string
 	HostPort string
+	Proto    string
 }
+
+type Volume struct {
+	Path      string
+	HostPath  string
+	ReadWrite bool
+}
+
 type RuntimeContainer struct {
 	ID        string
 	Addresses []Address
@@ -46,6 +60,7 @@ type RuntimeContainer struct {
 	Name      string
 	Image     DockerImage
 	Env       map[string]string
+	Volumes   map[string]Volume
 }
 
 type DockerImage struct {
@@ -66,13 +81,14 @@ func (i *DockerImage) String() string {
 }
 
 type Config struct {
-	Template      string
-	Dest          string
-	Watch         bool
-	NotifyCmd     string
-	OnlyExposed   bool
-	OnlyPublished bool
-	Interval      int
+	Template         string
+	Dest             string
+	Watch            bool
+	NotifyCmd        string
+	NotifyContainers map[string]docker.Signal
+	OnlyExposed      bool
+	OnlyPublished    bool
+	Interval         int
 }
 
 type ConfigFile struct {
@@ -89,7 +105,6 @@ func (c *Context) Env() map[string]string {
 		env[parts[0]] = parts[1]
 	}
 	return env
-
 }
 
 func (c *ConfigFile) filterWatches() ConfigFile {
@@ -120,7 +135,22 @@ func (r *RuntimeContainer) PublishedAddresses() []Address {
 }
 
 func usage() {
-	println("Usage: docker-gen [-config file] [-watch=false] [-notify=\"restart xyz\"] [-interval=0] [-endpoint tcp|unix://..] <template> [<dest>]")
+	println("Usage: docker-gen [-config file] [-watch=false] [-notify=\"restart xyz\"] [-notify-sighup=\"container-ID\"] [-interval=0] [-endpoint tcp|unix://..] [-tlscert file] [-tlskey file] [-tlscacert file] [-tlsverify] <template> [<dest>]")
+}
+
+func NewDockerClient(endpoint string) (*docker.Client, error) {
+	if strings.HasPrefix(endpoint, "unix:") {
+		return docker.NewClient(endpoint)
+	} else if tlsVerify || tlsCert != "" || tlsKey != "" || tlsCaCert != "" {
+		if tlsVerify {
+			if tlsCaCert == "" {
+				return nil, errors.New("TLS verification was requested, but no -tlscacert was provided")
+			}
+		}
+
+		return docker.NewTLSClient(endpoint, tlsCert, tlsKey, tlsCaCert)
+	}
+	return docker.NewClient(endpoint)
 }
 
 func generateFromContainers(client *docker.Client) {
@@ -136,6 +166,7 @@ func generateFromContainers(client *docker.Client) {
 			continue
 		}
 		runNotifyCmd(config)
+		sendSignalToContainer(client, config)
 	}
 }
 
@@ -145,12 +176,28 @@ func runNotifyCmd(config Config) {
 	}
 
 	log.Printf("Running '%s'", config.NotifyCmd)
-	args := strings.Split(config.NotifyCmd, " ")
-	cmd := exec.Command(args[0], args[1:]...)
+	cmd := exec.Command("/bin/sh", "-c", config.NotifyCmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("error running notify command: %s, %s\n", config.NotifyCmd, err)
+		log.Printf("Error running notify command: %s, %s\n", config.NotifyCmd, err)
 		log.Print(string(out))
+	}
+}
+
+func sendSignalToContainer(client *docker.Client, config Config) {
+	if len(config.NotifyContainers) < 1 {
+		return
+	}
+
+	for container, signal := range config.NotifyContainers {
+		log.Printf("Sending container '%s' signal '%v'", container, signal)
+		killOpts := docker.KillContainerOptions{
+			ID:     container,
+			Signal: signal,
+		}
+		if err := client.KillContainer(killOpts); err != nil {
+			log.Printf("Error sending signal to container: %s", err)
+		}
 	}
 }
 
@@ -181,12 +228,13 @@ func generateAtInterval(client *docker.Client, configs ConfigFile) {
 				case <-ticker.C:
 					containers, err := getContainers(client)
 					if err != nil {
-						log.Printf("error listing containers: %s\n", err)
+						log.Printf("Error listing containers: %s\n", err)
 						continue
 					}
 					// ignore changed return value. always run notify command
 					generateFile(configCopy, containers)
 					runNotifyCmd(configCopy)
+					sendSignalToContainer(client, configCopy)
 				case <-quit:
 					ticker.Stop()
 					return
@@ -204,18 +252,79 @@ func generateFromEvents(client *docker.Client, configs ConfigFile) {
 
 	wg.Add(1)
 	defer wg.Done()
-	log.Println("Watching docker events")
-	eventChan := getEvents()
-	for {
-		event := <-eventChan
 
-		if event == nil {
-			continue
+	for {
+		if client == nil {
+			var err error
+			endpoint, err := getEndpoint()
+			if err != nil {
+				log.Printf("Bad endpoint: %s", err)
+				time.Sleep(10 * time.Second)
+				continue
+			}
+
+			client, err = NewDockerClient(endpoint)
+			if err != nil {
+				log.Printf("Unable to connect to docker daemon: %s", err)
+				time.Sleep(10 * time.Second)
+				continue
+			}
+			generateFromContainers(client)
 		}
 
-		if event.Status == "start" || event.Status == "stop" || event.Status == "die" {
-			log.Printf("Received event %s for container %s", event.Status, event.ContainerID[:12])
-			generateFromContainers(client)
+		eventChan := make(chan *docker.APIEvents, 100)
+		defer close(eventChan)
+
+		watching := false
+		for {
+
+			if client == nil {
+				break
+			}
+			err := client.Ping()
+			if err != nil {
+				log.Printf("Unable to ping docker daemon: %s", err)
+				if watching {
+					client.RemoveEventListener(eventChan)
+					watching = false
+					client = nil
+				}
+				time.Sleep(10 * time.Second)
+				break
+
+			}
+
+			if !watching {
+				err = client.AddEventListener(eventChan)
+				if err != nil && err != docker.ErrListenerAlreadyExists {
+					log.Printf("Error registering docker event listener: %s", err)
+					time.Sleep(10 * time.Second)
+					continue
+				}
+				watching = true
+				log.Println("Watching docker events")
+			}
+
+			select {
+
+			case event := <-eventChan:
+				if event == nil {
+					if watching {
+						client.RemoveEventListener(eventChan)
+						watching = false
+						client = nil
+					}
+					break
+				}
+
+				if event.Status == "start" || event.Status == "stop" || event.Status == "die" {
+					log.Printf("Received event %s for container %s", event.Status, event.ID[:12])
+					generateFromContainers(client)
+				}
+			case <-time.After(10 * time.Second):
+				// check for docker liveness
+			}
+
 		}
 	}
 }
@@ -226,9 +335,14 @@ func initFlags() {
 	flag.BoolVar(&onlyExposed, "only-exposed", false, "only include containers with exposed ports")
 	flag.BoolVar(&onlyPublished, "only-published", false, "only include containers with published ports (implies -only-exposed)")
 	flag.StringVar(&notifyCmd, "notify", "", "run command after template is regenerated")
+	flag.StringVar(&notifySigHUPContainerID, "notify-sighup", "", "send HUP signal to container.  Equivalent to `docker kill -s HUP container-ID`")
 	flag.StringVar(&configFile, "config", "", "config file with template directives")
 	flag.IntVar(&interval, "interval", 0, "notify command interval (s)")
 	flag.StringVar(&endpoint, "endpoint", "", "docker api endpoint")
+	flag.StringVar(&tlsCert, "tlscert", "", "path to TLS client certificate file")
+	flag.StringVar(&tlsKey, "tlskey", "", "path to TLS client key file")
+	flag.StringVar(&tlsCaCert, "tlscacert", "", "path to TLS CA certificate file")
+	flag.BoolVar(&tlsVerify, "tlsverify", false, "verify docker daemon's TLS certicate")
 	flag.Parse()
 }
 
@@ -248,18 +362,21 @@ func main() {
 	if configFile != "" {
 		err := loadConfig(configFile)
 		if err != nil {
-			log.Printf("error loading config %s: %s\n", configFile, err)
-			os.Exit(1)
+			log.Fatalf("error loading config %s: %s\n", configFile, err)
 		}
 	} else {
 		config := Config{
-			Template:      flag.Arg(0),
-			Dest:          flag.Arg(1),
-			Watch:         watch,
-			NotifyCmd:     notifyCmd,
-			OnlyExposed:   onlyExposed,
-			OnlyPublished: onlyPublished,
-			Interval:      interval,
+			Template:         flag.Arg(0),
+			Dest:             flag.Arg(1),
+			Watch:            watch,
+			NotifyCmd:        notifyCmd,
+			NotifyContainers: make(map[string]docker.Signal),
+			OnlyExposed:      onlyExposed,
+			OnlyPublished:    onlyPublished,
+			Interval:         interval,
+		}
+		if notifySigHUPContainerID != "" {
+			config.NotifyContainers[notifySigHUPContainerID] = docker.SIGHUP
 		}
 		configs = ConfigFile{
 			Config: []Config{config}}
@@ -270,9 +387,9 @@ func main() {
 		log.Fatalf("Bad endpoint: %s", err)
 	}
 
-	client, err := docker.NewClient(endpoint)
+	client, err := NewDockerClient(endpoint)
 	if err != nil {
-		log.Fatalf("Unable to parse %s: %s", endpoint, err)
+		log.Fatalf("Unable to create docker client: %s", err)
 	}
 
 	generateFromContainers(client)
