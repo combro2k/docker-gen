@@ -69,6 +69,49 @@ func groupByKeys(entries []*RuntimeContainer, key string) []string {
 	return ret
 }
 
+// selects entries based on key
+func where(entries []*RuntimeContainer, key string, cmp string) []*RuntimeContainer {
+	selection := []*RuntimeContainer{}
+	for _, v := range entries {
+		value := deepGet(*v, key)
+		if value == cmp {
+			selection = append(selection, v)
+		}
+	}
+	return selection
+}
+
+// selects entries based on key.  Assumes key is delimited and breaks it apart before comparing
+func whereAny(entries []*RuntimeContainer, key, sep string, cmp []string) []*RuntimeContainer {
+	selection := []*RuntimeContainer{}
+	for _, v := range entries {
+		value := deepGet(*v, key)
+		if value != nil {
+			items := strings.Split(value.(string), sep)
+			if len(intersect(cmp, items)) > 0 {
+				selection = append(selection, v)
+			}
+		}
+	}
+	return selection
+}
+
+// selects entries based on key.  Assumes key is delimited and breaks it apart before comparing
+func whereAll(entries []*RuntimeContainer, key, sep string, cmp []string) []*RuntimeContainer {
+	selection := []*RuntimeContainer{}
+	req_count := len(cmp)
+	for _, v := range entries {
+		value := deepGet(*v, key)
+		if value != nil {
+			items := strings.Split(value.(string), sep)
+			if len(intersect(cmp, items)) == req_count {
+				selection = append(selection, v)
+			}
+		}
+	}
+	return selection
+}
+
 // hasPrefix returns whether a given string is a prefix of another string
 func hasPrefix(prefix, s string) bool {
 	return strings.HasPrefix(s, prefix)
@@ -96,6 +139,24 @@ func keys(input interface{}) (interface{}, error) {
 	}
 
 	return k, nil
+}
+
+func intersect(l1, l2 []string) []string {
+	m := make(map[string]bool)
+	m2 := make(map[string]bool)
+	for _, v := range l2 {
+		m2[v] = true
+	}
+	for _, v := range l1 {
+		if m2[v] {
+			m[v] = true
+		}
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func contains(item map[string]string, key string) bool {
@@ -219,6 +280,7 @@ func generateFile(config Config, containers Context) bool {
 		"hasPrefix":    hasPrefix,
 		"hasSuffix":    hasSuffix,
 		"json":         marshalJson,
+		"intersect":    intersect,
 		"keys":         keys,
 		"last":         arrayLast,
 		"replace":      strings.Replace,
@@ -226,6 +288,9 @@ func generateFile(config Config, containers Context) bool {
 		"split":        strings.Split,
 		"trimPrefix":   trimPrefix,
 		"trimSuffix":   trimSuffix,
+		"where":        where,
+		"whereAny":     whereAny,
+		"whereAll":     whereAll,
 	}).ParseFiles(templatePath)
 	if err != nil {
 		log.Fatalf("unable to parse template: %s", err)
